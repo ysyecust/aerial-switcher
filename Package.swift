@@ -12,6 +12,6 @@ let package = Package(
     targets: [
         .target(name: "AerialCore"),
         .executableTarget(name: "AerialSwitcher", dependencies: ["AerialCore"]),
-        .testTarget(name: "AerialCoreTests", dependencies: ["AerialCore"]),
+        .testTarget(name: "AerialCoreTests", dependencies: ["AerialCore", "AerialSwitcher"]),
     ]
 )

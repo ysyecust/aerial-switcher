@@ -15,17 +15,34 @@ public struct Paths: Sendable {
         self.appSupport = appSupport
     }
 
-    public init(home: URL) {
+    public static let bundledManifest = URL(
+        fileURLWithPath: "/System/Library/ExtensionKit/Extensions/WallpaperAerialsExtension.appex/Contents/Resources/entries.json"
+    )
+
+    public init(home: URL, bundledManifest: URL? = nil) {
         let wallpaper = home.appendingPathComponent("Library/Application Support/com.apple.wallpaper")
+        let downloadedManifest = wallpaper.appendingPathComponent("aerials/manifest/entries.json")
+        let manifest: URL
+        if !FileManager.default.fileExists(atPath: downloadedManifest.path),
+           let bundledManifest,
+           FileManager.default.fileExists(atPath: bundledManifest.path) {
+            manifest = bundledManifest
+        } else {
+            manifest = downloadedManifest
+        }
         self.init(
-            manifest: wallpaper.appendingPathComponent("aerials/manifest/entries.json"),
+            manifest: manifest,
             store: wallpaper.appendingPathComponent("Store/Index.plist"),
             videos: wallpaper.appendingPathComponent("aerials/videos"),
             appSupport: home.appendingPathComponent("Library/Application Support/AerialSwitcher")
         )
     }
 
-    public static let live = Paths(home: FileManager.default.homeDirectoryForCurrentUser)
+    /// Re-evaluated on access so a downloaded manifest takes over from the bundled fallback
+    /// once macOS fetches one.
+    public static var live: Paths {
+        Paths(home: FileManager.default.homeDirectoryForCurrentUser, bundledManifest: bundledManifest)
+    }
 
     public var config: URL { appSupport.appendingPathComponent("config.json") }
     public var storeBackup: URL { appSupport.appendingPathComponent("Index.original.plist") }

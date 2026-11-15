@@ -41,11 +41,16 @@ struct SettingsView: View {
             .padding(.top, 4)
             .padding(.bottom, 8)
 
-            Group {
+            VStack(alignment: .leading, spacing: 16) {
                 switch tab {
                 case .aerials: AerialsPane(model: model)
                 case .general: GeneralPane(model: model)
                 case .about: AboutPane()
+                }
+                if tab != .about, let error = model.error {
+                    Text(error)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(.horizontal, 32)
@@ -114,6 +119,10 @@ private struct AerialsPane: View {
                             Caption(downloadTitle(download))
                         } else {
                             Caption(tr("One place, filmed at different times of day."))
+                            if model.canRetryDownload {
+                                Button(tr("Retry Download")) { model.downloadMissing() }
+                                    .controlSize(.small)
+                            }
                         }
                     }
                 }
@@ -134,10 +143,6 @@ private struct AerialsPane: View {
                     }
                     Caption(tr("Drag a handle to change when that part of the day begins."))
                 }
-            }
-
-            if let error = model.error {
-                Text(tr(error)).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
         }
     }

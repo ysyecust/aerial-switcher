@@ -20,6 +20,7 @@ final class SettingsWindow {
     }
 
     func show() {
+        if model.sets.isEmpty { model.loadSets() }
         let window = window ?? makeWindow()
         // In the Dock and ⌘Tab while Settings is open; back to menu bar only once closed.
         NSApp.setActivationPolicy(.regular)

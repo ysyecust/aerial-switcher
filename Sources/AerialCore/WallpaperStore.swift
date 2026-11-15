@@ -36,22 +36,30 @@ public struct WallpaperStore: Sendable {
     }
 
     /// Shows `assetID` on every display and space. Desktop entries that aren't an Aerial are
-    /// replaced; screen saver entries are only updated if they already show an Aerial.
+    /// replaced; screen saver entries are only updated if they already show an Aerial (and,
+    /// once the app has taken over, haven't been changed to a different Aerial since).
     /// The user's own wallpaper is kept so it can be restored: the store as it was before
     /// the first change, refreshed whenever the user has picked something else since.
     @discardableResult
     public func setAerial(_ assetID: String, now: Date = Date()) throws -> Int {
-        let store = try load()
+        let store = try load(from: paths.store)
         let config = try PropertyListSerialization.data(fromPropertyList: ["assetID": assetID], format: .binary, options: 0)
+        let takingOver = !(hasBackup && isShowingOwnChange)
+        let previousAssetID = lastSetAssetID
         var count = 0
 
-        for scope in scopes(in: store) {
+        for (_, scope) in scopedPaths(in: store) {
             for key in Self.desktopEntries + Self.screenSaverEntries {
                 guard
                     let entry = scope[key] as? NSMutableDictionary,
                     let content = entry["Content"] as? NSMutableDictionary,
                     let choices = content["Choices"] as? NSMutableArray
                 else { continue }
+
+                if Self.screenSaverEntries.contains(key), !takingOver,
+                   !Self.entryShowsOwnChange(entry, ownAssetID: previousAssetID) {
+                    continue
+                }
 
                 var changed = false
                 for case let choice as NSMutableDictionary in choices where choice["Provider"] as? String == Self.aerialProvider {
@@ -76,7 +84,7 @@ public struct WallpaperStore: Sendable {
         }
 
         guard count > 0 else { throw AerialError("No wallpaper entries were found in the wallpaper store.") }
-        try backUpUsersWallpaper()
+        try backUpUsersWallpaper(takingOver: takingOver)
         let data = try PropertyListSerialization.data(fromPropertyList: store, format: .binary, options: 0)
         try data.write(to: paths.store, options: .atomic)
         try Data(assetID.utf8).write(to: paths.lastSet, options: .atomic)
@@ -87,21 +95,47 @@ public struct WallpaperStore: Sendable {
 
     /// Whether the wallpaper showing is the one this app last set, not one the user picked since.
     public var isShowingOwnChange: Bool {
-        guard let data = try? Data(contentsOf: paths.lastSet) else {
+        guard let assetID = lastSetAssetID else {
             // 1.0.0 kept a backup but didn't record its change; any Aerial counts as its own.
             guard hasBackup, case .aerial = try? state() else { return false }
             return true
         }
-        return (try? state()) == .aerial(assetID: String(decoding: data, as: UTF8.self))
+        return (try? state()) == .aerial(assetID: assetID)
     }
 
     /// Puts back the user's wallpaper, unless they have already picked another one since
-    /// this app's last change. Returns whether the store was changed.
+    /// this app's last change. Screen saver edits and newly added display/space scopes made
+    /// in the meantime are preserved. Returns whether the store was changed.
     @discardableResult
     public func restoreBackup() throws -> Bool {
         let restore = hasBackup && isShowingOwnChange
         if restore {
-            try Data(contentsOf: paths.storeBackup).write(to: paths.store, options: .atomic)
+            let current = try load(from: paths.store)
+            let backup = try load(from: paths.storeBackup)
+            let ownAssetID = lastSetAssetID
+            let fallback = fallbackScope(in: backup)
+
+            for (path, scope) in scopedPaths(in: current) {
+                let original = self.scope(at: path, in: backup) ?? fallback
+                let originalDesktop = (original?["Desktop"] ?? original?["Linked"]) as? NSDictionary
+
+                for key in Self.desktopEntries where scope[key] != nil {
+                    if let entry = (original?[key] as? NSDictionary) ?? originalDesktop {
+                        scope[key] = entry
+                    }
+                }
+                for key in Self.screenSaverEntries {
+                    guard
+                        let currentEntry = scope[key] as? NSDictionary,
+                        Self.entryShowsOwnChange(currentEntry, ownAssetID: ownAssetID),
+                        let originalEntry = original?[key] as? NSDictionary
+                    else { continue }
+                    scope[key] = originalEntry
+                }
+            }
+
+            let data = try PropertyListSerialization.data(fromPropertyList: current, format: .binary, options: 0)
+            try data.write(to: paths.store, options: .atomic)
         }
         try? FileManager.default.removeItem(at: paths.storeBackup)
         try? FileManager.default.removeItem(at: paths.lastSet)
@@ -119,9 +153,13 @@ public struct WallpaperStore: Sendable {
 
     // MARK: - Helpers
 
-    private func load() throws -> NSMutableDictionary {
+    private var lastSetAssetID: String? {
+        (try? Data(contentsOf: paths.lastSet)).map { String(decoding: $0, as: UTF8.self) }
+    }
+
+    private func load(from url: URL? = nil) throws -> NSMutableDictionary {
         guard
-            let data = try? Data(contentsOf: paths.store),
+            let data = try? Data(contentsOf: url ?? paths.store),
             let plist = try? PropertyListSerialization.propertyList(from: data, options: .mutableContainersAndLeaves, format: nil),
             let store = plist as? NSMutableDictionary
         else {
@@ -130,31 +168,64 @@ public struct WallpaperStore: Sendable {
         return store
     }
 
-    private func backUpUsersWallpaper() throws {
-        guard !(hasBackup && isShowingOwnChange) else { return }
+    private func backUpUsersWallpaper(takingOver: Bool) throws {
+        guard takingOver else { return }
         try FileManager.default.createDirectory(at: paths.appSupport, withIntermediateDirectories: true)
         try Data(contentsOf: paths.store).write(to: paths.storeBackup, options: .atomic)
     }
 
-    /// Every dictionary holding entries. Per-display and per-space scopes nest: with
-    /// "Show on all Spaces" off, a space keeps its own `Default` and `Displays.<display>`.
-    private func scopes(in store: NSDictionary) -> [NSMutableDictionary] {
+    /// Every dictionary holding entries, along with its key path in the store. Per-display and
+    /// per-space scopes nest: with "Show on all Spaces" off, a space keeps its own `Default`
+    /// and `Displays.<display>`.
+    private func scopedPaths(in store: NSDictionary) -> [(path: [String], scope: NSMutableDictionary)] {
         let entryKeys = Self.desktopEntries + Self.screenSaverEntries
-        func collect(_ value: Any) -> [NSMutableDictionary] {
+        func collect(_ value: Any, at path: [String]) -> [([String], NSMutableDictionary)] {
             guard let dictionary = value as? NSMutableDictionary else { return [] }
-            if entryKeys.contains(where: { dictionary[$0] != nil }) { return [dictionary] }
-            return dictionary.allValues.flatMap(collect)
+            if entryKeys.contains(where: { dictionary[$0] != nil }) { return [(path, dictionary)] }
+            return dictionary.compactMap { key, child -> [([String], NSMutableDictionary)]? in
+                guard let key = key as? String else { return nil }
+                return collect(child, at: path + [key])
+            }.flatMap { $0 }
         }
-        return ["AllSpacesAndDisplays", "SystemDefault", "Displays", "Spaces"].flatMap { store[$0].map(collect) ?? [] }
+        return ["AllSpacesAndDisplays", "SystemDefault", "Displays", "Spaces"].flatMap { key in
+            store[key].map { collect($0, at: [key]) } ?? []
+        }
+    }
+
+    private func scope(at path: [String], in store: NSDictionary) -> NSMutableDictionary? {
+        var current: Any = store
+        for key in path {
+            guard let dictionary = current as? NSDictionary, let next = dictionary[key] else { return nil }
+            current = next
+        }
+        return current as? NSMutableDictionary
+    }
+
+    private func fallbackScope(in store: NSDictionary) -> NSMutableDictionary? {
+        (store["AllSpacesAndDisplays"] as? NSMutableDictionary)
+            ?? (store["SystemDefault"] as? NSMutableDictionary)
+            ?? scopedPaths(in: store).first?.scope
     }
 
     private func desktopChoices(in store: NSDictionary) -> [NSDictionary] {
-        scopes(in: store).flatMap { scope in
+        scopedPaths(in: store).flatMap { _, scope in
             Self.desktopEntries.flatMap { key -> [NSDictionary] in
                 let content = (scope[key] as? NSDictionary)?["Content"] as? NSDictionary
                 return (content?["Choices"] as? [NSDictionary]) ?? []
             }
         }
+    }
+
+    private static func entryShowsOwnChange(_ entry: NSDictionary, ownAssetID: String?) -> Bool {
+        guard
+            let content = entry["Content"] as? NSDictionary,
+            let choices = content["Choices"] as? [NSDictionary],
+            !choices.isEmpty
+        else { return false }
+        if let ownAssetID {
+            return choices.allSatisfy { assetID(of: $0) == ownAssetID }
+        }
+        return choices.allSatisfy { assetID(of: $0) != nil }
     }
 
     private static func assetID(of choice: NSDictionary) -> String? {

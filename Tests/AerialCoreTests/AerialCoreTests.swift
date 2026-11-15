@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 @testable import AerialCore
+@testable import AerialSwitcher
 
 @Suite struct ManifestTests {
     @Test func findsOnlyDayCycleSets() {
@@ -32,6 +33,22 @@ import Testing
         #expect(ids.contains { $0.hasPrefix("0DC99DD8") })
         #expect(ids.contains { $0.hasPrefix("78D1B993") })
         #expect(!ids.contains { $0.hasPrefix("3CC63110") })
+    }
+
+    @Test func fallsBackToTheBundledManifestUntilDownloaded() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let home = root.appendingPathComponent("home")
+        let bundled = root.appendingPathComponent("bundled/entries.json")
+        try FileManager.default.createDirectory(at: bundled.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Fixtures.manifest.write(to: bundled)
+
+        let fallbackPaths = Paths(home: home, bundledManifest: bundled)
+        #expect(fallbackPaths.manifest == bundled)
+
+        let downloaded = Paths(home: home).manifest
+        try FileManager.default.createDirectory(at: downloaded.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Fixtures.manifest.write(to: downloaded)
+        #expect(Paths(home: home, bundledManifest: bundled).manifest == downloaded)
     }
 }
 
@@ -137,6 +154,71 @@ import Testing
     @Test func missingStoreThrows() {
         let paths = Paths(home: URL(fileURLWithPath: "/nonexistent"))
         #expect(throws: AerialError.self) { try WallpaperStore(paths: paths).state() }
+    }
+
+    @Test func preservesScreenSaverUnlinkedAfterTakeover() throws {
+        let aerial = { (id: String) in Fixtures.choice(provider: "com.apple.wallpaper.choice.aerials", config: ["assetID": id]) }
+        let paths = try Fixtures.paths(store: Fixtures.store(Fixtures.imageChoice))
+        let store = WallpaperStore(paths: paths)
+        try store.setAerial("TA-DAY")
+
+        // User picks a separate screen saver in System Settings while desktop stays on TA-DAY:
+        // macOS splits Linked into Desktop + Idle.
+        let splitScope: [String: Any] = [
+            "Desktop": ["Content": ["Choices": [aerial("TA-DAY")], "Shuffle": "$null"]],
+            "Idle": ["Content": ["Choices": [aerial("USER-SAVER")], "Shuffle": "$null"]],
+            "Type": "individual",
+        ]
+        try Fixtures.write(["AllSpacesAndDisplays": splitScope, "SystemDefault": splitScope, "Displays": [String: Any](), "Spaces": [String: Any]()], to: paths)
+
+        // Subsequent scheduled switches leave the user's new Aerial screen saver alone.
+        try store.setAerial("TA-EVENING")
+        let afterSwitch = NSDictionary(contentsOf: paths.store)!
+        let saverDuringRun = (afterSwitch.value(forKeyPath: "AllSpacesAndDisplays.Idle.Content.Choices") as! [NSDictionary])[0]
+        let saverConfig = try PropertyListSerialization.propertyList(from: saverDuringRun["Configuration"] as! Data, format: nil) as! NSDictionary
+        #expect(saverConfig["assetID"] as? String == "USER-SAVER")
+
+        // Turning off restores the original image desktop while keeping the user's screen saver.
+        #expect(try store.restoreBackup())
+        #expect(try store.state() == .other)
+        let afterRestore = NSDictionary(contentsOf: paths.store)!
+        let saverAfterRestore = (afterRestore.value(forKeyPath: "AllSpacesAndDisplays.Idle.Content.Choices") as! [NSDictionary])[0]
+        let restoredConfig = try PropertyListSerialization.propertyList(from: saverAfterRestore["Configuration"] as! Data, format: nil) as! NSDictionary
+        #expect(restoredConfig["assetID"] as? String == "USER-SAVER")
+    }
+
+    @Test func restoresUntouchedAerialScreenSaverButKeepsEditedOne() throws {
+        let aerial = { (id: String) in Fixtures.choice(provider: "com.apple.wallpaper.choice.aerials", config: ["assetID": id]) }
+        let initialScope: [String: Any] = [
+            "Desktop": ["Content": ["Choices": [Fixtures.imageChoice], "Shuffle": "$null"]],
+            "Idle": ["Content": ["Choices": [aerial("ORIG-SAVER")], "Shuffle": "$null"]],
+            "Type": "individual",
+        ]
+        let initialStore: [String: Any] = ["AllSpacesAndDisplays": initialScope, "SystemDefault": initialScope, "Displays": [String: Any](), "Spaces": [String: Any]()]
+
+        // Case 1: screen saver untouched -> restored back to ORIG-SAVER.
+        let untouchedPaths = try Fixtures.paths(store: initialStore)
+        let untouchedStore = WallpaperStore(paths: untouchedPaths)
+        try untouchedStore.setAerial("TA-DAY")
+        #expect(try untouchedStore.restoreBackup())
+        let restoredIdle = (NSDictionary(contentsOf: untouchedPaths.store)!.value(forKeyPath: "AllSpacesAndDisplays.Idle.Content.Choices") as! [NSDictionary])[0]
+        let restoredConfig = try PropertyListSerialization.propertyList(from: restoredIdle["Configuration"] as! Data, format: nil) as! NSDictionary
+        #expect(restoredConfig["assetID"] as? String == "ORIG-SAVER")
+
+        // Case 2: user changes screen saver to defaultChoice -> preserved on restore.
+        let editedPaths = try Fixtures.paths(store: initialStore)
+        let editedStore = WallpaperStore(paths: editedPaths)
+        try editedStore.setAerial("TA-DAY")
+        let editedScope: [String: Any] = [
+            "Desktop": ["Content": ["Choices": [aerial("TA-DAY")], "Shuffle": "$null"]],
+            "Idle": ["Content": ["Choices": [Fixtures.defaultChoice], "Shuffle": "$null"]],
+            "Type": "individual",
+        ]
+        try Fixtures.write(["AllSpacesAndDisplays": editedScope, "SystemDefault": editedScope, "Displays": [String: Any](), "Spaces": [String: Any]()], to: editedPaths)
+        #expect(try editedStore.restoreBackup())
+        #expect(try editedStore.state() == .other)
+        let keptIdle = (NSDictionary(contentsOf: editedPaths.store)!.value(forKeyPath: "AllSpacesAndDisplays.Idle.Content.Choices") as! [NSDictionary])[0]
+        #expect(keptIdle["Provider"] as? String == "default")
     }
 }
 
@@ -244,5 +326,85 @@ import Testing
 
     @Test func missingFileGivesDefaults() {
         #expect(Config.load(from: URL(fileURLWithPath: "/nonexistent.json")) == Config())
+    }
+}
+
+@MainActor
+@Suite struct AppModelTests {
+    private func makePaths(withManifest: Bool = true) throws -> Paths {
+        let paths = try Fixtures.paths(store: Fixtures.store(Fixtures.imageChoice))
+        if withManifest {
+            try FileManager.default.createDirectory(at: paths.manifest.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Fixtures.manifest.write(to: paths.manifest)
+            let loctable = paths.manifest.deletingLastPathComponent()
+                .appendingPathComponent("TVIdleScreenStrings.bundle/Contents/Resources/Localizable.nocache.loctable")
+            try FileManager.default.createDirectory(at: loctable.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try PropertyListSerialization.data(fromPropertyList: Fixtures.strings.tables, format: .binary, options: 0).write(to: loctable)
+        }
+        return paths
+    }
+
+    @Test func keepsManifestErrorAcrossSyncsUntilManifestAppears() throws {
+        let paths = try makePaths(withManifest: false)
+        let model = AppModel(paths: { paths }, reload: {}, startBackgroundTasks: false)
+        #expect(model.sets.isEmpty)
+        #expect(model.error != nil)
+
+        model.sync(force: true)
+        #expect(model.error != nil)
+
+        try FileManager.default.createDirectory(at: paths.manifest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Fixtures.manifest.write(to: paths.manifest)
+        model.sync(force: true)
+        #expect(!model.sets.isEmpty)
+        #expect(model.error == nil)
+    }
+
+    @Test func keepsSaveErrorAfterSync() throws {
+        let paths = try makePaths()
+        try Fixtures.download(Fixtures.tahoe.aerials.map(\.id), into: paths)
+        // Block config directory creation with a plain file at appSupport.
+        try Data([0]).write(to: paths.appSupport)
+
+        let model = AppModel(paths: { paths }, reload: {}, startBackgroundTasks: false)
+        model.selectSet("tahoe")
+        #expect(model.error != nil)
+    }
+
+    @Test func keepsDownloadErrorAcrossSyncsAndRetriesCleanly() async throws {
+        let paths = try makePaths()
+        var shouldFail = true
+        let model = AppModel(
+            paths: { paths },
+            reload: {},
+            downloadVideo: { aerial, _ in
+                if shouldFail { throw AerialError("HTTP 503") }
+                try Fixtures.download([aerial.id], into: paths)
+            },
+            fetchDownloadSize: { _ in 1024 },
+            startBackgroundTasks: false
+        )
+
+        model.selectSet("tahoe")
+        while model.download != nil { await Task.yield() }
+
+        #expect(model.error?.contains("HTTP 503") == true)
+        #expect(model.canRetryDownload)
+
+        // Periodic / forced syncs must not wipe out the download error or loop retries.
+        model.sync()
+        model.sync(force: true)
+        #expect(model.error?.contains("HTTP 503") == true)
+
+        // Manual retry succeeds, clears the error, and switches wallpaper.
+        shouldFail = false
+        model.downloadMissing()
+        while model.download != nil { await Task.yield() }
+
+        #expect(model.error == nil)
+        #expect(!model.canRetryDownload)
+        if case .aerial = try WallpaperStore(paths: paths).state() {} else {
+            Issue.record("Expected wallpaper to switch after retry succeeded")
+        }
     }
 }

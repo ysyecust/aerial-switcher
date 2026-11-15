@@ -6,6 +6,9 @@ struct MenuContent: View {
 
     var body: some View {
         ForEach(statusLines, id: \.self) { Text($0) }
+        if model.canRetryDownload {
+            Button(tr("Retry Download")) { model.downloadMissing() }
+        }
         Divider()
         Toggle(tr("Switch Wallpaper"), isOn: Binding(get: { model.config.enabled }, set: { model.setEnabled($0) }))
             .disabled(model.selectedSet == nil)
@@ -29,17 +32,19 @@ struct MenuContent: View {
     }
 
     private var statusLines: [String] {
-        guard let set = model.selectedSet else { return [model.error.map { tr($0) } ?? tr("Choose a set below")] }
+        guard let set = model.selectedSet else { return [model.error ?? tr("Choose a set below")] }
         var lines = [[tr(set.name), model.config.enabled ? model.currentPhase?.name : nil].compactMap { $0 }.joined(separator: " · ")]
 
         if let error = model.error {
-            lines.append("⚠︎ " + tr(error))
+            lines.append("⚠︎ " + error)
         } else if let download = model.download {
             lines.append(tr("Downloading %1$@ of %2$@ · %3$@%%", "\(download.index + 1)", "\(download.count)", "\(Int(download.fraction * 100))"))
         } else if !model.config.enabled {
             lines.append(tr("Off · original wallpaper"))
         } else if model.config.paused {
             lines.append(tr("Paused"))
+        } else if case .notDownloaded = model.result {
+            lines.append(tr("Video not downloaded"))
         } else if let next = model.nextChange {
             let time = next.date.formatted(Date.FormatStyle(date: .omitted, time: .shortened).locale(Localization.shared.locale))
             lines.append(tr("%1$@ at %2$@", next.phase.name, time))

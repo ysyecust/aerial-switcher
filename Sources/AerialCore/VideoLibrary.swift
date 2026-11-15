@@ -42,7 +42,7 @@ public struct VideoLibrary: Sendable {
     /// task never reports progress, and a cancelled one leaves its partial file behind.
     public func download(_ aerial: Aerial, progress: @escaping @Sendable (Double) -> Void = { _ in }) async throws {
         guard let url = aerial.videoURL else {
-            throw AerialError("\(aerial.label) has no download link in the manifest.")
+            throw AerialError("No download link in the manifest.")
         }
         let fileManager = FileManager.default
         try fileManager.createDirectory(at: paths.partialDownloads, withIntermediateDirectories: true)
@@ -54,8 +54,8 @@ public struct VideoLibrary: Sendable {
         defer { session.invalidateAndCancel() }
         do {
             try await writer.run(session.dataTask(with: url))
-        } catch DownloadWriter.Failure.status {
-            throw AerialError("Downloading \(aerial.label) failed.")
+        } catch DownloadWriter.Failure.status(let code) {
+            throw AerialError(code > 0 ? "HTTP \(code)" : "Unexpected response.")
         }
 
         let destination = file(for: aerial)
@@ -72,7 +72,7 @@ public struct VideoLibrary: Sendable {
 
 /// Writes a data task's response to a file, reporting progress in whole percents.
 private final class DownloadWriter: NSObject, URLSessionDataDelegate, Sendable {
-    enum Failure: Error { case status }
+    enum Failure: Error { case status(Int) }
 
     private struct State {
         var handle: FileHandle
@@ -115,8 +115,9 @@ private final class DownloadWriter: NSObject, URLSessionDataDelegate, Sendable {
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse) async -> URLSession.ResponseDisposition {
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            state.withLockUnchecked { $0.failure = Failure.status }
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else {
+            state.withLockUnchecked { $0.failure = Failure.status(code) }
             return .cancel
         }
         state.withLockUnchecked { $0.expected = response.expectedContentLength }
